@@ -2729,10 +2729,9 @@ namespace Oxide.Plugins
             LootEntry? lootEntry = null;
             Item? item;
 
-            bool asBP = RNG.NextDouble() < _config.Generic.BlueprintWeight && !blockBPs;
+            bool asBP = !blockBPs && TotalBlueprintWeights[type] > 0 && RNG.NextDouble() < _config.Generic.BlueprintWeight;
             string itemEntryName = string.Empty;
             int maxRetry = 10 * itemCount;
-            int limit = 0;
 
             // TODO change duplicate regen to O(1) nudge to next or previous neighbour
             do
@@ -2745,6 +2744,7 @@ namespace Oxide.Plugins
                 }
 
                 item = null;
+                int limit = 0;
                 
                 var weightList = Pool.Get<List<int>>();
                 var prefabList = Pool.Get<List<List<string>>>();
@@ -2752,6 +2752,17 @@ namespace Oxide.Plugins
                 var totalWeight = asBP ? TotalBlueprintWeights[type] : TotalItemWeights[type];
                 weightList.AddRange(asBP ? BlueprintWeights[type] : ItemWeights[type]);
                 prefabList.AddRange(asBP ? Blueprints[type] : Items[type]);
+
+                if (totalWeight <= 0)
+                {
+                    Pool.FreeUnmanaged(ref weightList);
+                    Pool.FreeUnmanaged(ref prefabList);
+
+                    if (--maxRetry <= 0)
+                        break;
+
+                    continue;
+                }
 
                 var r = RNG.Next(totalWeight);
                 for (int i = 0; i < 5; ++i)
@@ -2781,9 +2792,10 @@ namespace Oxide.Plugins
                 if (!entry.UngroupedItems.TryGetValue(itemEntryName + (asBP ? ".blueprint" : string.Empty), out lootEntry) || lootEntry is null)
                 {
                     Puts($"Cannot get config for item {itemEntryName} in prefab {type} bp: {asBP}");
-                    Pool.FreeUnmanaged(ref selectFrom);
+                    if (--maxRetry <= 0)
+                        break;
 
-                    return (null, null);
+                    continue;
                 }
                 
                 if (!lootEntry.allowDuplicates && currentItemEntries.Contains(itemEntryName))
@@ -2800,6 +2812,13 @@ namespace Oxide.Plugins
 
                 string itemShortname = UniqueTagREGEX.Replace(itemEntryName, string.Empty);  // Remove tag
                 ItemDefinition itemDef = ItemManager.FindItemDefinition(itemShortname);
+                if (itemDef is null)
+                {
+                    if (--maxRetry <= 0)
+                        break;
+
+                    continue;
+                }
 
                 if (asBP && itemDef.Blueprint is not null && itemDef.Blueprint.isResearchable)
                 {
