@@ -22,7 +22,7 @@ using Oxide.Plugins.BetterLootExtensions;
 
 namespace Oxide.Plugins
 {
-    [Info("BetterLoot", "MagicServices.co // TGWA", "4.3.0")]
+        [Info("BetterLoot", "MagicServices.co // TGWA", "4.3.1")]
     [Description("A light loot container modification system with rarity support | Previously maintained and updated by Khan & Tryhard")]
     public class BetterLoot : RustPlugin
     {
@@ -302,6 +302,44 @@ namespace Oxide.Plugins
         private static bool IsUnwrapKey(string key)
             => key.StartsWith(UNWRAP_PREFIX, StringComparison.OrdinalIgnoreCase);
 
+        private static bool IsNpcLootPrefab(string prefab)
+            => prefab.IndexOf("/humannpc/", StringComparison.OrdinalIgnoreCase) >= 0
+               || prefab.IndexOf("scientistnpc", StringComparison.OrdinalIgnoreCase) >= 0
+               || prefab.IndexOf("/scientist/gen2/", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private static string StripUniqueTag(string key)
+        {
+            if (string.IsNullOrEmpty(key) || UniqueTagREGEX is null || key.IndexOf('{') < 0)
+                return key;
+
+            return UniqueTagREGEX.Replace(key, string.Empty);
+        }
+
+        private void TuneRuntimeHooks()
+        {
+            if (!_config.Loot.EnableHammerLootCycle)
+                Unsubscribe(nameof(OnMeleeAttack));
+
+            bool watchNpcs = false;
+            bool watchUnwraps = false;
+            foreach (var kv in _config.Generic.WatchedPrefabs)
+            {
+                if (!kv.Value)
+                    continue;
+
+                if (IsUnwrapKey(kv.Key))
+                    watchUnwraps = true;
+                else if (IsNpcLootPrefab(kv.Key))
+                    watchNpcs = true;
+            }
+
+            if (!watchNpcs)
+                Unsubscribe(nameof(OnCorpsePopulate));
+
+            if (!watchUnwraps)
+                Unsubscribe(nameof(OnItemUnwrap));
+        }
+
         private static ItemModUnwrap? FindUnwrapMod(string key)
         {
             if (!IsUnwrapKey(key))
@@ -463,6 +501,7 @@ namespace Oxide.Plugins
             Pool.FreeUnmanaged(ref DurabilityItems);
 
             UpdateInternals(_config.Generic.ListUpdatesOnLoad);
+            TuneRuntimeHooks();
         }
 
         private void Unload()
@@ -485,8 +524,14 @@ namespace Oxide.Plugins
             _instance = null;
             _config = null;
 
-            foreach (HammerHitLootCycle hhlc in UnityEngine.Object.FindObjectsByType<HammerHitLootCycle>(FindObjectsInactive.Include, FindObjectsSortMode.None).Where(i => i is not null))
-                UnityEngine.Object.Destroy(hhlc);
+            if (_config?.Loot.EnableHammerLootCycle == true)
+            {
+                foreach (HammerHitLootCycle hhlc in UnityEngine.Object.FindObjectsByType<HammerHitLootCycle>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+                {
+                    if (hhlc is not null)
+                        UnityEngine.Object.Destroy(hhlc);
+                }
+            }
         }
 
         // Set flag so new prefabs can be autoenabled
@@ -982,7 +1027,7 @@ namespace Oxide.Plugins
 
             #region Random Profile Selector
             [JsonIgnore]
-            private List<int> _enabledProfiles = new (); // Map position to index
+            private readonly List<int> _enabledProfiles = new(); // Map position to index
 
             /// <summary>
             /// Implemented binary search to select random loot import profile quickly. Returns null if should select from ungrouped items.
@@ -995,19 +1040,21 @@ namespace Oxide.Plugins
                     return null;
 
                 if (!DoProbabilitiesExist)
-                { // Updates and uses probalistic probability based off of only enabled profiles
-                    List<LootProfileImport> _enabledProfiles = new List<LootProfileImport>();
+                {
+                    this._enabledProfiles.Clear();
+                    var enabledProbabilities = Pool.Get<List<double>>();
                     for (int i = 0; i < LootProfiles.Count; i++)
                     {
                         var _profile = LootProfiles[i];
-                        if (_profile.Enabled)
-                        {
-                            _enabledProfiles.Add(_profile);
-                            this._enabledProfiles.Add(i);
-                        }
+                        if (!_profile.Enabled)
+                            continue;
+
+                        enabledProbabilities.Add(_profile.LootProfileProbability);
+                        this._enabledProfiles.Add(i);
                     }
 
-                    UpdateProbabilities(_enabledProfiles.Select(x => x.LootProfileProbability));
+                    UpdateProbabilities(enabledProbabilities);
+                    Pool.FreeUnmanaged(ref enabledProbabilities);
                 }
 
                 int randomProfileIndex = GetRandomIndex();
@@ -1046,10 +1093,28 @@ namespace Oxide.Plugins
             [JsonProperty("Item List")]
             public Dictionary<string, LootRNG> ItemList;
 
+            [JsonIgnore]
+            private List<KeyValuePair<string, LootRNG>>? _orderedItems;
+
             public LootProfile(Dictionary<string, LootRNG> ItemList, bool Enabled = true)
             {
                 this.ItemList = ItemList;
                 this.Enabled = Enabled;
+            }
+
+            private List<KeyValuePair<string, LootRNG>> OrderedItems
+            {
+                get
+                {
+                    if (_orderedItems == null || _orderedItems.Count != ItemList.Count)
+                    {
+                        _orderedItems = new List<KeyValuePair<string, LootRNG>>(ItemList.Count);
+                        foreach (var kv in ItemList)
+                            _orderedItems.Add(kv);
+                    }
+
+                    return _orderedItems;
+                }
             }
 
             public class LootRNG
@@ -1073,35 +1138,34 @@ namespace Oxide.Plugins
             /// </summary>
             public (ItemConvertInfo?, List<ItemConvertInfo>?) GetItem(HashSet<string> currentItemEntries)
             {
+                var ordered = OrderedItems;
                 int itemIndex = GetRandomIndex();
 
                 // No item found, out of index
-                if (itemIndex >= ItemList.Count)
+                if (itemIndex >= ordered.Count)
                     return (null, null);
 
-                var bonusItems = new List<ItemConvertInfo>();
-
-                var entry = ItemList.ElementAt(itemIndex);
+                List<ItemConvertInfo>? bonusItems = null;
+                var entry = ordered[itemIndex];
 
                 if (!entry.Value.Amount.allowDuplicates && currentItemEntries.Contains(entry.Key))
                 {
                     // Only item in the list and it's a duplicate, else all hope is lost :(
-                    if (ItemList.Count == 1)
+                    if (ordered.Count == 1)
                         return (null, null);
 
                     // Prefer the larger-index neighbour, fall back to smaller
-                    if (itemIndex < ItemList.Count - 1) itemIndex++;
-                    else if (itemIndex > 0 && (entry.Value.Probability - ItemList.ElementAt(itemIndex - 1).Value.Probability) <= _config.LootGroupsConfig.AllowedDuplicateNudgeDifference) itemIndex--;
+                    if (itemIndex < ordered.Count - 1) itemIndex++;
+                    else if (itemIndex > 0 && (entry.Value.Probability - ordered[itemIndex - 1].Value.Probability) <= _config.LootGroupsConfig.AllowedDuplicateNudgeDifference) itemIndex--;
                     else return (null, null);
 
-                    // Set entry to the entry of the nudged index
-                    entry = ItemList.ElementAt(itemIndex);
+                    entry = ordered[itemIndex];
                 }
 
                 entry.Value.Amount.CreateBonusItems(ref bonusItems);
 
                 // Create Item
-                string sanitizedName = UniqueTagREGEX.Replace(entry.Key, string.Empty);
+                string sanitizedName = StripUniqueTag(entry.Key);
                 Item item = ItemManager.CreateByPartialName(sanitizedName, GetRNG(entry.Value.Amount.Min, entry.Value.Amount.Max), entry.Value.Amount.SkinId);
                 
                 // Apply custom properties
@@ -1430,7 +1494,7 @@ namespace Oxide.Plugins
                 foreach (var bonusItemEntry in additionalItems)
                 {
                     var _bonusItemEntry = bonusItemEntry.Value;
-                    Item bonusItem = ItemManager.CreateByName(UniqueTagREGEX.Replace(bonusItemEntry.Key, string.Empty), GetRNG(_bonusItemEntry.Min, _bonusItemEntry.Max) * _config.Loot.LootMultiplier, _bonusItemEntry.SkinId);
+                    Item bonusItem = ItemManager.CreateByName(StripUniqueTag(bonusItemEntry.Key), GetRNG(_bonusItemEntry.Min, _bonusItemEntry.Max) * _config.Loot.LootMultiplier, _bonusItemEntry.SkinId);
                     
                     if (bonusItem is null)
                         continue;
@@ -2232,6 +2296,38 @@ namespace Oxide.Plugins
         }
         #endregion
 
+        private static bool IsGeneratedDuplicate(Item item, bool bonusItem, bool isLootGroupItem,
+            bool allowGroupDupes, bool allowBonusDupes, bool allowDupes,
+            IList<string> itemNames, IList<int> itemBlueprints)
+        {
+            if (!((isLootGroupItem && !allowGroupDupes) || (bonusItem && !allowBonusDupes) || (!bonusItem && !allowDupes)))
+                return false;
+
+            return itemNames.Contains(item.info.shortname)
+                   || (item.IsBlueprint() && itemBlueprints.Contains(item.blueprintTarget));
+        }
+
+        private static void SelectFromLootProfile(LootProfile lootProfile, HashSet<string> currentItemEntries,
+            List<KeyValuePair<string, LootEntrySettings>> pendingGuaranteed, ref ItemConvertInfo? itemInfo,
+            ref List<ItemConvertInfo>? bonusItems, ref bool isLootGroupItem)
+        {
+            if (!lootProfile.DoProbabilitiesExist)
+            {
+                var probabilities = Pool.Get<List<double>>();
+                foreach (var item in lootProfile.ItemList)
+                    probabilities.Add(item.Value.Probability);
+                lootProfile.UpdateProbabilities(probabilities);
+                Pool.FreeUnmanaged(ref probabilities);
+            }
+
+            (itemInfo, bonusItems) = lootProfile.GetItem(currentItemEntries);
+            if (itemInfo == null)
+                return;
+
+            pendingGuaranteed.AddRange(lootProfile.GuaranteedItems);
+            isLootGroupItem = true;
+        }
+
         private bool PopulateContainer(ItemContainer? container, string? prefab)
             => PopulateContainer(container, prefab, true, null, null, out _);
 
@@ -2285,49 +2381,30 @@ namespace Oxide.Plugins
                 lockedProfile = con.GetRandomProfile(prefab); // Loot pool locking sets an initial profile, if none was set a profile will be selected every time pulling items from either a group or 'null group' (pulling from ungrouped items)
             
             int maxRetry = 10;
-            
+            var pendingGuaranteed = Pool.Get<List<KeyValuePair<string, LootEntrySettings>>>();
+
             for (int i = guaranteedItemsCount ? guaranteedItemEntries.Count : 0; i < itemCount; ++i)
             {
                 ItemConvertInfo? itemInfo = null;
                 List<ItemConvertInfo>? bonusItems = null;
-                
-                // Internal buffer of items that will be added to the container's items at end of generation iteration
-                List<KeyValuePair<string, LootEntrySettings>> _guaranteedItemEntries = 
-                    Pool.Get<List<KeyValuePair<string, LootEntrySettings>>>();
+                pendingGuaranteed.Clear();
                 bool isLootGroupItem = false;
-             
-                void profileSelect(LootProfile lootProfile)
-                {
-                    // Generate if profile is being selected for the first time.
-                    if (!lootProfile.DoProbabilitiesExist)
-                        lootProfile.UpdateProbabilities(lootProfile.ItemList.Select(x => x.Value.Probability));
 
-                    // Attempt to get item from selected profile.
-                    (itemInfo, bonusItems) = lootProfile.GetItem(currentItemEntries);
-
-                    if (itemInfo != null)
-                    {
-                        // Add all guaranteed items from profile (if profile selected use all items regardless)
-                        _guaranteedItemEntries.AddRange(lootProfile.GuaranteedItems);
-                        isLootGroupItem = true;
-                    }
-                } 
-                
                 try
                 {
-                    if (lockedProfile is not null) // Loot Pool Locking
+                    if (lockedProfile is not null)
                     {
-                        profileSelect(lockedProfile);
-                    } else // Normal System
+                        SelectFromLootProfile(lockedProfile, currentItemEntries, pendingGuaranteed, ref itemInfo, ref bonusItems, ref isLootGroupItem);
+                    }
+                    else
                     {
                         #region Attempt Loot Import Select
                         if (!lootLockingEnabled && con.GetRandomProfile(prefab) is {} profile)
-                            profileSelect(profile);
+                            SelectFromLootProfile(profile, currentItemEntries, pendingGuaranteed, ref itemInfo, ref bonusItems, ref isLootGroupItem);
                         #endregion
                         
                         // Used if LPL is enabled but no profile import was used (selecting ungrouped profile as the locked profile)
                         #region Ungrouped Items Select
-                        // Loot import not used, generate from ungrouped items with default rng system
                         if (itemInfo == null)
                         {
                             if (con.IgnoreRarityBias) 
@@ -2354,14 +2431,7 @@ namespace Oxide.Plugins
                     continue;
                 }
 
-                // Duplicate checking
-                bool IsDuplicate(Item item, bool bonusItem) =>
-                    ((isLootGroupItem && !allowGroupDupes) || (bonusItem && !allowBonusDupes) ||
-                     (!bonusItem && !allowDupes)) && ((itemNames.Contains(item.info.shortname) ||
-                                                       (item.IsBlueprint() &&
-                                                        itemBlueprints.Contains(item.blueprintTarget))));
-
-                if (IsDuplicate(itemInfo.Item, false))
+                if (IsGeneratedDuplicate(itemInfo.Item, false, isLootGroupItem, allowGroupDupes, allowBonusDupes, allowDupes, itemNames, itemBlueprints))
                 {
                     itemInfo.Item.Remove();
                     if (--maxRetry <= 0)
@@ -2393,7 +2463,7 @@ namespace Oxide.Plugins
                 {
                     foreach (ItemConvertInfo bonusItem in bonusItems)
                     {
-                        if (IsDuplicate(bonusItem.Item, true))
+                        if (IsGeneratedDuplicate(bonusItem.Item, true, isLootGroupItem, allowGroupDupes, allowBonusDupes, allowDupes, itemNames, itemBlueprints))
                             bonusItem.Item.Remove();
                         else
                         {
@@ -2407,24 +2477,25 @@ namespace Oxide.Plugins
 
                 if (guaranteedItemsCount)
                 {
-                    int t = Math.Min(itemCount - i, _guaranteedItemEntries.Count);
-                    guaranteedItemEntries.AddRange(_guaranteedItemEntries.Take(t));
+                    int t = Math.Min(itemCount - i, pendingGuaranteed.Count);
+                    for (int g = 0; g < t; g++)
+                        guaranteedItemEntries.Add(pendingGuaranteed[g]);
                     if ((i += t) >= itemCount)
                         break;
                 }
                 else
                 {
-                    guaranteedItemEntries.AddRange(_guaranteedItemEntries);
+                    guaranteedItemEntries.AddRange(pendingGuaranteed);
                 }
-
-                Pool.FreeUnmanaged(ref _guaranteedItemEntries);
             }
+
+            Pool.FreeUnmanaged(ref pendingGuaranteed);
 
             guaranteedItemEntries.Shuffle((uint)GetRNG(0, 100));
             foreach (var gItemEntry in guaranteedItemEntries)
             {
                 // Spawn item. No rng, just spawn em.
-                string itemName = UniqueTagREGEX.Replace(gItemEntry.Key, string.Empty);
+                string itemName = StripUniqueTag(gItemEntry.Key);
                 bool spawnAsBlueprint = itemName.EndsWith(".blueprint", StringComparison.OrdinalIgnoreCase);
                 itemName = itemName.Replace(".blueprint", string.Empty, StringComparison.OrdinalIgnoreCase);
 
@@ -2530,8 +2601,12 @@ namespace Oxide.Plugins
             }
 
             items.Shuffle((uint)UnityEngine.Random.Range(0, 100));
-            foreach (var item in items.Where(entry => entry is not null && entry.Item.IsValid()))
+            for (int i = 0; i < items.Count; i++)
             {
+                var item = items[i];
+                if (item is null || !item.Item.IsValid())
+                    continue;
+
                 if (item.Item.MoveToContainer(container) ||
                     (overflowContainer is not null && item.Item.MoveToContainer(overflowContainer)))
                 {
@@ -2572,7 +2647,11 @@ namespace Oxide.Plugins
 
             // Pre kill crate markers to avoid spam.
             var crates = Pool.Get<PooledList<HackableLockedCrate>>();
-            crates.AddRange(BaseNetworkable.serverEntities.OfType<HackableLockedCrate>().Where(c => c is { IsDestroyed: false, mapMarkerInstance: { IsDestroyed: false } }));
+            foreach (var entity in BaseNetworkable.serverEntities)
+            {
+                if (entity is HackableLockedCrate crate && !crate.IsDestroyed && crate.mapMarkerInstance is { IsDestroyed: false })
+                    crates.Add(crate);
+            }
             foreach (var crate in crates)
                 crate.mapMarkerInstance.Kill();
 
@@ -2584,13 +2663,17 @@ namespace Oxide.Plugins
                 if (_config.Generic.RemoveStackedContainers)
                     FixLoot();
 
-                foreach (var container in BaseNetworkable.serverEntities.Where(e => e is LootContainer or RHIB))
+                foreach (var entity in BaseNetworkable.serverEntities)
                 {
-                    // API Check
-                    if (container is LootContainer lootContainer && !APICheck((BaseEntity)container) && PopulateContainer(lootContainer))
+                    if (entity is LootContainer lootContainer)
+                    {
+                        if (!APICheck(lootContainer) && PopulateContainer(lootContainer))
+                            populatedContainers++;
+                    }
+                    else if (entity is RHIB && entity.GetComponent<LootFill>() is { } lf && !APICheck((BaseEntity)entity) && PopulateContainer(lf))
+                    {
                         populatedContainers++;
-                    else if (container.GetComponent<LootFill>() is { } lf && !APICheck((BaseEntity)container) && PopulateContainer(lf))
-                        populatedContainers++;
+                    }
                 }
 
                 if (doLog)
@@ -2614,43 +2697,58 @@ namespace Oxide.Plugins
 
         private void FixLoot()
         {
-            var spawns = Resources.FindObjectsOfTypeAll<LootContainer>()
-                .Where(c => c.isActiveAndEnabled)
-                .OrderBy(c => c.transform.position.x).ThenBy(c => c.transform.position.z)
-                .ToList();
+            var spawns = Pool.Get<List<LootContainer>>();
+            foreach (var entity in BaseNetworkable.serverEntities)
+            {
+                if (entity is LootContainer container && container.isActiveAndEnabled && !container.IsDestroyed)
+                    spawns.Add(container);
+            }
+
+            spawns.Sort((a, b) =>
+            {
+                int cmp = a.transform.position.x.CompareTo(b.transform.position.x);
+                return cmp != 0 ? cmp : a.transform.position.z.CompareTo(b.transform.position.z);
+            });
 
             var count = spawns.Count;
             var racelimit = count * count;
-
             var antirace = 0;
             var deleted = 0;
+            const float stackedSqr = 0.25f * 0.25f;
 
             for (var i = 0; i < count; i++)
             {
                 var box = spawns[i];
-                var pos = new Vector2(box.transform.position.x, box.transform.position.z);
+                var pos = box.transform.position;
 
                 if (++antirace > racelimit)
+                {
+                    Pool.FreeUnmanaged(ref spawns);
                     return;
+                }
 
                 var next = i + 1;
                 while (next < count)
                 {
                     var box2 = spawns[next];
-                    var pos2 = new Vector2(box2.transform.position.x, box2.transform.position.z);
-                    var distance = Vector2.Distance(pos, pos2);
+                    var pos2 = box2.transform.position;
+                    float dx = pos.x - pos2.x;
+                    float dz = pos.z - pos2.z;
 
                     if (++antirace > racelimit)
+                    {
+                        Pool.FreeUnmanaged(ref spawns);
                         return;
+                    }
 
-                    if (distance < 0.25f)
+                    if (dx * dx + dz * dz < stackedSqr)
                     {
                         spawns.RemoveAt(next);
                         count--;
 
-                        if (box2 is BaseEntity _box2 && !_box2.IsDestroyed)
+                        if (!box2.IsDestroyed)
                         {
-                            _box2.KillMessage();
+                            box2.KillMessage();
                             deleted++;
                         }
                     }
@@ -2658,6 +2756,8 @@ namespace Oxide.Plugins
                         break;
                 }
             }
+
+            Pool.FreeUnmanaged(ref spawns);
 
             if (deleted > 0)
                 Log($"Removed {deleted} stacked LootContainer");
@@ -2669,13 +2769,29 @@ namespace Oxide.Plugins
         private (ItemConvertInfo? item, List<ItemConvertInfo>? bonusItems) UngroupedFlatSelect(PrefabLoot entry, HashSet<string> currentItemEntries, bool blockBPs = false)
         {
             bool asBP = RNG.NextDouble() < _config.Generic.BlueprintWeight && !blockBPs;
-            if (entry.UngroupedItems.Where(x => !(currentItemEntries.Contains(x.Key) && !x.Value.allowDuplicates) && x.Key.EndsWith(".blueprint", StringComparison.OrdinalIgnoreCase) == asBP).ToArray() is not [_, ..] availableEntries)
+            int matchCount = 0;
+            string? selectedKey = null;
+            LootEntry? lootEntry = null;
+
+            foreach (var x in entry.UngroupedItems)
+            {
+                if (currentItemEntries.Contains(x.Key) && !x.Value.allowDuplicates)
+                    continue;
+                if (x.Key.EndsWith(".blueprint", StringComparison.OrdinalIgnoreCase) != asBP)
+                    continue;
+
+                matchCount++;
+                if (RNG.Next(matchCount) == 0)
+                {
+                    selectedKey = x.Key;
+                    lootEntry = x.Value;
+                }
+            }
+
+            if (selectedKey is null || lootEntry is null)
                 return default;
 
-            var selectedEntry = availableEntries[RNG.Next(availableEntries.Length)];
-            var lootEntry = selectedEntry.Value;
-            
-            string itemShortname = UniqueTagREGEX.Replace(selectedEntry.Key, string.Empty).Replace(".blueprint", string.Empty, StringComparison.OrdinalIgnoreCase); // Remove tag
+            string itemShortname = StripUniqueTag(selectedKey).Replace(".blueprint", string.Empty, StringComparison.OrdinalIgnoreCase);
 
             List<ItemConvertInfo>? bonusItems = null;
             ItemDefinition itemDef = ItemManager.FindItemDefinition(itemShortname);
@@ -2707,7 +2823,7 @@ namespace Oxide.Plugins
             lootEntry.CreateBonusItems(ref bonusItems); // Create bonus items and apply attachments
             
             // Add for future duplicate checking.
-            currentItemEntries.Add(selectedEntry.Key);
+            currentItemEntries.Add(selectedKey);
             
             item.OnVirginSpawn();
             return (new ItemConvertInfo(item, lootEntry.CanConvertToBlueprint ?? false), bonusItems);
@@ -2724,61 +2840,40 @@ namespace Oxide.Plugins
         /// <returns>Random item and its bonus item list if applicable.</returns>
         private (ItemConvertInfo? item, List<ItemConvertInfo>? bonusItem) MightyRNG(PrefabLoot entry, HashSet<string> currentItemEntries, string type, int itemCount, bool blockBPs = false)
         {
-            List<string>? selectFrom = Pool.Get<List<string>>();
             List<ItemConvertInfo>? bonusItems = null;
             LootEntry? lootEntry = null;
-            Item? item;
+            Item? item = null;
 
-            bool asBP = !blockBPs && TotalBlueprintWeights[type] > 0 && RNG.NextDouble() < _config.Generic.BlueprintWeight;
+            bool asBP = !blockBPs && TotalBlueprintWeights.TryGetValue(type, out int bpWeight) && bpWeight > 0 && RNG.NextDouble() < _config.Generic.BlueprintWeight;
             string itemEntryName = string.Empty;
             int maxRetry = 10 * itemCount;
 
-            // TODO change duplicate regen to O(1) nudge to next or previous neighbour
+            var weightLookup = asBP ? TotalBlueprintWeights : TotalItemWeights;
+            if (!weightLookup.TryGetValue(type, out int totalWeight) || totalWeight <= 0)
+                return (null, null);
+
+            int[] weights = asBP ? BlueprintWeights[type] : ItemWeights[type];
+            List<string>[] buckets = asBP ? Blueprints[type] : Items[type];
+            int bucketCount = Math.Min(5, Math.Min(weights.Length, buckets.Length));
+
             do
             {
-                // Repool
-                if (selectFrom.Count > 0)
-                {
-                    Pool.FreeUnmanaged(ref selectFrom);
-                    selectFrom = Pool.Get<List<string>>();
-                }
-
                 item = null;
                 int limit = 0;
-                
-                var weightList = Pool.Get<List<int>>();
-                var prefabList = Pool.Get<List<List<string>>>();
-
-                var totalWeight = asBP ? TotalBlueprintWeights[type] : TotalItemWeights[type];
-                weightList.AddRange(asBP ? BlueprintWeights[type] : ItemWeights[type]);
-                prefabList.AddRange(asBP ? Blueprints[type] : Items[type]);
-
-                if (totalWeight <= 0)
-                {
-                    Pool.FreeUnmanaged(ref weightList);
-                    Pool.FreeUnmanaged(ref prefabList);
-
-                    if (--maxRetry <= 0)
-                        break;
-
-                    continue;
-                }
-
                 var r = RNG.Next(totalWeight);
-                for (int i = 0; i < 5; ++i)
+                List<string>? bucket = null;
+
+                for (int i = 0; i < bucketCount; ++i)
                 {
-                    limit += weightList[i];
+                    limit += weights[i];
                     if (r < limit)
                     {
-                        selectFrom.AddRange(prefabList[i]);
+                        bucket = buckets[i];
                         break;
                     }
                 }
 
-                Pool.FreeUnmanaged(ref weightList);
-                Pool.FreeUnmanaged(ref prefabList);
-
-                if (selectFrom.Count == 0)
+                if (bucket is null || bucket.Count == 0)
                 {
                     if (--maxRetry <= 0)
                         break;
@@ -2786,8 +2881,7 @@ namespace Oxide.Plugins
                     continue;
                 }
 
-                // Select item name
-                itemEntryName = selectFrom[RNG.Next(0, selectFrom.Count)];
+                itemEntryName = bucket[RNG.Next(0, bucket.Count)];
 
                 if (!entry.UngroupedItems.TryGetValue(itemEntryName + (asBP ? ".blueprint" : string.Empty), out lootEntry) || lootEntry is null)
                 {
@@ -2800,7 +2894,6 @@ namespace Oxide.Plugins
                 
                 if (!lootEntry.allowDuplicates && currentItemEntries.Contains(itemEntryName))
                 {
-                    // Check if is only possible item to avoid retry if needed
                     if (entry.UngroupedItems.Count == 1)
                         return (null, null);
 
@@ -2810,7 +2903,7 @@ namespace Oxide.Plugins
                     continue;
                 }
 
-                string itemShortname = UniqueTagREGEX.Replace(itemEntryName, string.Empty);  // Remove tag
+                string itemShortname = StripUniqueTag(itemEntryName);
                 ItemDefinition itemDef = ItemManager.FindItemDefinition(itemShortname);
                 if (itemDef is null)
                 {
@@ -2830,8 +2923,7 @@ namespace Oxide.Plugins
                     item = ItemManager.Create(itemDef);
                 }
 
-                // Shouldn't happen
-                if (item.info is null)
+                if (item?.info is null)
                 {
                     if (--maxRetry <= 0)
                         break;
@@ -2841,9 +2933,6 @@ namespace Oxide.Plugins
 
                 break;
             } while (true);
-            
-            if (selectFrom is [_, ..])
-                Pool.FreeUnmanaged(ref selectFrom);
 
             if (item is null)
                 return (null, null);
@@ -2869,8 +2958,8 @@ namespace Oxide.Plugins
         }
 
         
-        private bool ItemExists(string name)
-            => ItemManager.itemList.Any(id => id.shortname.Equals(name,  StringComparison.OrdinalIgnoreCase));
+        private static bool ItemExists(string name)
+            => ItemManager.FindItemDefinition(name) is not null;
 
         // API
         private bool isSupplyDropActive()
@@ -3177,7 +3266,11 @@ namespace Oxide.Plugins
                 return;
 
             Item item = player.GetActiveItem();
-            if (item is null || item.hasCondition || !player.IsAdmin || !item.ToString().Contains("hammer"))
+            if (item?.info is null || item.hasCondition || !player.IsAdmin)
+                return;
+
+            string shortname = item.info.shortname;
+            if (shortname.IndexOf("hammer", StringComparison.OrdinalIgnoreCase) < 0)
                 return;
 
             BaseEntity entity = c.HitEntity;
@@ -3275,7 +3368,15 @@ namespace Oxide.Plugins.BetterLootExtensions
             => item.condition = (conditionPercentage / 100f) * item.maxCondition;
 
         public static bool ContainsPartial(this List<string> list, string partialString)
-            => list.Any(partialString.Contains);
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (partialString.Contains(list[i]))
+                    return true;
+            }
+
+            return false;
+        }
         public static bool IsDefault<T>(this T obj)
             => EqualityComparer<T>.Default.Equals(obj, default);
         public static int RemoveAll<TKey, TValue>(this IDictionary<TKey, TValue> dict, Func<TKey, bool> predicate)
