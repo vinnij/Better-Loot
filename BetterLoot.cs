@@ -22,7 +22,7 @@ using Oxide.Plugins.BetterLootExtensions;
 
 namespace Oxide.Plugins
 {
-    [Info("BetterLoot", "MagicServices.co // TGWA", "4.3.0")]
+    [Info("BetterLoot", "MagicServices.co // TGWA", "4.4.0")]
     [Description("A light loot container modification system with rarity support | Previously maintained and updated by Khan & Tryhard")]
     public class BetterLoot : RustPlugin
     {
@@ -907,6 +907,8 @@ namespace Oxide.Plugins
                 public string LootProfileName = string.Empty;
                 [JsonProperty("Loot Profile Probability (1% - 100%)")]
                 public double LootProfileProbability;
+                [JsonProperty("Max Items From Profile (0 = unlimited)")]
+                public int MaxItemsFromProfile = 0;
 
                 internal LootProfileImport() { }
 
@@ -984,30 +986,138 @@ namespace Oxide.Plugins
             [JsonIgnore]
             private List<int> _enabledProfiles = new (); // Map position to index
 
+            internal bool IsProfileAtItemLimit(string? profileName, Dictionary<string, int>? itemsTakenFromProfile)
+            {
+                if (string.IsNullOrEmpty(profileName) || LootProfiles is null || itemsTakenFromProfile is null)
+                    return false;
+
+                for (int i = 0; i < LootProfiles.Count; i++)
+                {
+                    LootProfileImport import = LootProfiles[i];
+                    if (!import.Enabled || import.LootProfileName != profileName)
+                        continue;
+
+                    if (import.MaxItemsFromProfile <= 0)
+                        return false;
+
+                    itemsTakenFromProfile.TryGetValue(profileName, out int taken);
+                    return taken >= import.MaxItemsFromProfile;
+                }
+
+                return false;
+            }
+
+            private bool HasEnabledProfileItemLimits()
+            {
+                if (LootProfiles is null)
+                    return false;
+
+                for (int i = 0; i < LootProfiles.Count; i++)
+                {
+                    LootProfileImport import = LootProfiles[i];
+                    if (import.Enabled && import.MaxItemsFromProfile > 0)
+                        return true;
+                }
+
+                return false;
+            }
+
+            private LootProfile? ResolveImportedProfile(LootProfileImport importProfile, string? tableReference, out string? selectedProfileName)
+            {
+                selectedProfileName = importProfile.LootProfileName;
+
+                if (lootGroups is null || !lootGroups.LootGroups.TryGetValue(importProfile.LootProfileName, out LootProfile? profile))
+                {
+                    Log($"WARNING: prefab \"{tableReference}\" requested a loot group import with name \"{importProfile.LootProfileName}\". Group does not exist or is disabled in the LootGroups.json!");
+                    selectedProfileName = null;
+                    return null;
+                }
+
+                if (!profile.Enabled)
+                {
+                    selectedProfileName = null;
+                    return null;
+                }
+
+                return profile;
+            }
+
+            private LootProfileImport? SelectRandomImport(List<LootProfileImport> imports)
+            {
+                if (imports.Count == 0)
+                    return null;
+
+                double cumulative = 0;
+                List<double> cumulatives = new List<double>(imports.Count);
+                for (int i = 0; i < imports.Count; i++)
+                {
+                    cumulative += imports[i].LootProfileProbability;
+                    cumulatives.Add(cumulative);
+                }
+
+                double randomSelect = RNG.NextDouble() * 1e2;
+                int elementIndex = cumulatives.BinarySearch(randomSelect);
+                if (elementIndex < 0)
+                    elementIndex = ~elementIndex;
+
+                if (elementIndex >= imports.Count)
+                    return null;
+
+                return imports[elementIndex];
+            }
+
             /// <summary>
             /// Implemented binary search to select random loot import profile quickly. Returns null if should select from ungrouped items.
             /// </summary>
             /// <param name="tableReference">for reference to use in error message if there is a problem with the selection or config</param>
             /// <returns></returns>
             public LootProfile? GetRandomProfile(string? tableReference)
+                => GetRandomProfile(tableReference, null, out _);
+
+            public LootProfile? GetRandomProfile(string? tableReference, Dictionary<string, int>? itemsTakenFromProfile, out string? selectedProfileName)
             {
+                selectedProfileName = null;
+
                 if (LootProfiles is null)
                     return null;
 
+                bool filterByItemLimit = itemsTakenFromProfile is not null && HasEnabledProfileItemLimits();
+                if (filterByItemLimit)
+                {
+                    List<LootProfileImport> remainingImports = new List<LootProfileImport>();
+                    for (int i = 0; i < LootProfiles.Count; i++)
+                    {
+                        LootProfileImport import = LootProfiles[i];
+                        if (!import.Enabled)
+                            continue;
+
+                        if (IsProfileAtItemLimit(import.LootProfileName, itemsTakenFromProfile))
+                            continue;
+
+                        remainingImports.Add(import);
+                    }
+
+                    LootProfileImport? limitedImport = SelectRandomImport(remainingImports);
+                    if (limitedImport is null)
+                        return null;
+
+                    return ResolveImportedProfile(limitedImport, tableReference, out selectedProfileName);
+                }
+
                 if (!DoProbabilitiesExist)
                 { // Updates and uses probalistic probability based off of only enabled profiles
-                    List<LootProfileImport> _enabledProfiles = new List<LootProfileImport>();
+                    List<LootProfileImport> enabledProfileImports = new List<LootProfileImport>();
                     for (int i = 0; i < LootProfiles.Count; i++)
                     {
                         var _profile = LootProfiles[i];
                         if (_profile.Enabled)
                         {
-                            _enabledProfiles.Add(_profile);
+                            enabledProfileImports.Add(_profile);
                             this._enabledProfiles.Add(i);
                         }
                     }
 
-                    UpdateProbabilities(_enabledProfiles.Select(x => x.LootProfileProbability));
+                    UpdateProbabilities(enabledProfileImports.Select(x => x.LootProfileProbability));
                 }
 
                 int randomProfileIndex = GetRandomIndex();
@@ -1015,18 +1125,7 @@ namespace Oxide.Plugins
                     return null;
 
                 var importProfile = LootProfiles[_enabledProfiles[randomProfileIndex]];
-
-                if (!lootGroups.LootGroups.TryGetValue(importProfile.LootProfileName, out LootProfile? profile))
-                {
-                    Log($"WARNING: prefab \"{tableReference}\" requested a loot group import with name \"{importProfile.LootProfileName}\". Group does not exist or is disabled in the LootGroups.json!");
-                    return null;
-                }
-                
-                // No Warning
-                if (!profile.Enabled)
-                    return null;
-
-                return profile;
+                return ResolveImportedProfile(importProfile, tableReference, out selectedProfileName);
             }
             #endregion
         }
@@ -2278,11 +2377,14 @@ namespace Oxide.Plugins
             using PooledHashSet<string> currentItemEntries = Pool.Get<PooledHashSet<string>>(); // Current unique item entry tags (for duplicate generation checking)
 
             guaranteedItemEntries.AddRange(con.GuaranteedItems);
+
+            Dictionary<string, int> profileItemCounts = new Dictionary<string, int>();
             
             // Attempt to select initial profile for LPL
             LootProfile? lockedProfile = null;
+            string? lockedProfileName = null;
             if (lootLockingEnabled)
-                lockedProfile = con.GetRandomProfile(prefab); // Loot pool locking sets an initial profile, if none was set a profile will be selected every time pulling items from either a group or 'null group' (pulling from ungrouped items)
+                lockedProfile = con.GetRandomProfile(prefab, profileItemCounts, out lockedProfileName); // Loot pool locking sets an initial profile, if none was set a profile will be selected every time pulling items from either a group or 'null group' (pulling from ungrouped items)
             
             int maxRetry = 10;
             
@@ -2295,8 +2397,9 @@ namespace Oxide.Plugins
                 List<KeyValuePair<string, LootEntrySettings>> _guaranteedItemEntries = 
                     Pool.Get<List<KeyValuePair<string, LootEntrySettings>>>();
                 bool isLootGroupItem = false;
+                string? selectedProfileName = null;
              
-                void profileSelect(LootProfile lootProfile)
+                void profileSelect(LootProfile lootProfile, string? profileName)
                 {
                     // Generate if profile is being selected for the first time.
                     if (!lootProfile.DoProbabilitiesExist)
@@ -2310,22 +2413,27 @@ namespace Oxide.Plugins
                         // Add all guaranteed items from profile (if profile selected use all items regardless)
                         _guaranteedItemEntries.AddRange(lootProfile.GuaranteedItems);
                         isLootGroupItem = true;
+                        selectedProfileName = profileName;
                     }
                 } 
                 
                 try
                 {
-                    if (lockedProfile is not null) // Loot Pool Locking
+                    bool useLockedProfile = lockedProfile is not null &&
+                                            !con.IsProfileAtItemLimit(lockedProfileName, profileItemCounts);
+
+                    if (useLockedProfile) // Loot Pool Locking
                     {
-                        profileSelect(lockedProfile);
-                    } else // Normal System
+                        profileSelect(lockedProfile!, lockedProfileName);
+                    } else // Normal System (or locked profile already hit its per-crate item cap)
                     {
                         #region Attempt Loot Import Select
-                        if (!lootLockingEnabled && con.GetRandomProfile(prefab) is {} profile)
-                            profileSelect(profile);
+                        if (!lootLockingEnabled && con.GetRandomProfile(prefab, profileItemCounts, out string? rolledProfileName) is {} profile)
+                            profileSelect(profile, rolledProfileName);
                         #endregion
                         
                         // Used if LPL is enabled but no profile import was used (selecting ungrouped profile as the locked profile)
+                        // Also used when a locked profile has already contributed its max items for this fill.
                         #region Ungrouped Items Select
                         // Loot import not used, generate from ungrouped items with default rng system
                         if (itemInfo == null)
@@ -2387,6 +2495,12 @@ namespace Oxide.Plugins
                 }
 
                 items.Add(itemInfo);
+
+                if (isLootGroupItem && selectedProfileName is not null)
+                {
+                    profileItemCounts.TryGetValue(selectedProfileName, out int takenFromProfile);
+                    profileItemCounts[selectedProfileName] = takenFromProfile + 1;
+                }
 
                 //Only if bonus items are present
                 if (bonusItems is not null)
