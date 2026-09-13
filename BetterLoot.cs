@@ -260,8 +260,6 @@ namespace Oxide.Plugins
         private readonly HashSet<string> _npcHarvestMissCache = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, OreType> _oreTypeCache = new Dictionary<string, OreType>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _oreTypeMissCache = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static readonly List<LootProfileImport> _profileImportScratch = new List<LootProfileImport>(16);
-        private static readonly List<double> _cumulativeScratch = new List<double>(16);
         private Coroutine spawnCoroutine;
         private Coroutine cleanupCoroutine;
         private bool _harmonyPatchesApplied;
@@ -2110,6 +2108,10 @@ namespace Oxide.Plugins
             #region Random Profile Selector
             [JsonIgnore]
             private List<int> _enabledProfiles = new (); // Map position to index
+            [JsonIgnore]
+            private static readonly List<LootProfileImport> _profileImportScratch = new List<LootProfileImport>(16);
+            [JsonIgnore]
+            private static readonly List<double> _cumulativeScratch = new List<double>(16);
 
             internal bool IsProfileAtItemLimit(string? profileName, Dictionary<string, int>? itemsTakenFromProfile)
             {
