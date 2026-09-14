@@ -340,6 +340,7 @@ namespace Oxide.Plugins
         private const string HQM_COLLECTABLE_PREFAB = "assets/bundled/prefabs/autospawn/collectable/stone/hqm-collectable.prefab";
         private const string COCONUT_COLLECTABLE_PREFAB = "assets/bundled/prefabs/autospawn/collectable/coconut/coconut-collectable.prefab";
         private const string DIESEL_COLLECTABLE_PREFAB = "assets/content/structures/excavator/prefabs/diesel_collectable.prefab";
+        private const string NATURAL_BEEHIVE_PREFAB = "assets/prefabs/resource/natural beehive/beehive.natural.prefab";
         private const string HALLOWEEN_BONE_PREFAB = "assets/bundled/prefabs/autospawn/collectable/stone/halloween/halloween-bone-collectable.prefab";
         private const string HALLOWEEN_METAL_PREFAB = "assets/bundled/prefabs/autospawn/collectable/stone/halloween/halloween-metal-collectable.prefab";
         private const string HALLOWEEN_STONE_PREFAB = "assets/bundled/prefabs/autospawn/collectable/stone/halloween/halloween-stone-collectable.prefab";
@@ -351,6 +352,10 @@ namespace Oxide.Plugins
         private static readonly string[] MineGatherTools = { "jackhammer", "icepick.salvaged", "pickaxe", "stone.pickaxe", "hammer.salvaged", "bone.club", "rock" };
         private static readonly string[] ChopGatherTools = { "chainsaw", "axe.salvaged", "hatchet", "stonehatchet", "hammer.salvaged", "bone.club", "rock" };
         private static readonly string[] FleshGatherTools = { "knife.skinning", "knife.butcher", "knife.combat", "machete", "knife.bone", "pitchfork", "hatchet", "salvaged.sword", "rock" };
+        private const string QUARRY_HQM_KEY = "HQM Quarry";
+        private const string QUARRY_STONE_KEY = "Stone Quarry";
+        private const string QUARRY_SULFUR_KEY = "Sulfur Quarry";
+        private const string QUARRY_EXCAVATOR_KEY = "Giant Excavator";
         #endregion
 
         #region Lang
@@ -581,6 +586,8 @@ namespace Oxide.Plugins
             public bool WipeOnUnload;
             [JsonProperty("NPC Harvest")]
             public Dictionary<string, NpcHarvestSettings> NpcHarvest = new Dictionary<string, NpcHarvestSettings>(StringComparer.OrdinalIgnoreCase);
+            [JsonProperty("Quarry Harvest")]
+            public Dictionary<string, QuarryHarvestSettings> QuarryHarvest = new Dictionary<string, QuarryHarvestSettings>(StringComparer.OrdinalIgnoreCase);
 
             private static OreTypeSettings WithGather(OreTypeSettings settings, params OreGatherOutput[] outputs)
             {
@@ -865,6 +872,8 @@ namespace Oxide.Plugins
             public List<OreBonusLootEntry> BonusLoot = new List<OreBonusLootEntry>();
             [JsonProperty("Override Gather Amounts")]
             public bool OverrideGatherAmounts;
+            [JsonProperty("Gather Multiplier")]
+            public float GatherMultiplier = 1f;
             [JsonProperty("Gather Outputs")]
             public List<OreGatherOutput> GatherOutputs = new List<OreGatherOutput>();
             [JsonProperty("Override Pickup Amounts")]
@@ -883,6 +892,22 @@ namespace Oxide.Plugins
             public bool OverrideGatherAmounts;
             [JsonProperty("Gather Outputs")]
             public List<OreGatherOutput> GatherOutputs = new List<OreGatherOutput>();
+        }
+
+        public class QuarryHarvestSettings
+        {
+            [JsonProperty("Override Gather Amounts")]
+            public bool OverrideGatherAmounts;
+            [JsonProperty("Outputs")]
+            public List<QuarryHarvestOutput> Outputs = new List<QuarryHarvestOutput>();
+        }
+
+        public class QuarryHarvestOutput
+        {
+            [JsonProperty("Item Shortname")]
+            public string Shortname = string.Empty;
+            [JsonProperty("Amount")]
+            public int Amount;
         }
 
         public class OreGatherOutput
@@ -936,10 +961,11 @@ namespace Oxide.Plugins
         private void CheckWatchedPrefabs()
         {
             /* Watched Prefabs Auto-Population */
+            NewConfigGenerated = _config.Generic.WatchedPrefabs.Count == 0;
+            EnsureNaturalBeehiveWatched();
+
             if (_config.Generic.OnlyUpdatePrefabListOnWipe && !NewSave) // If it is a new wipe new found prefabs will be auto enabled.
                 return;
-
-            NewConfigGenerated = _config.Generic.WatchedPrefabs.Count == 0;
 
             if (NewConfigGenerated)
                 Log("Checking for missing viable loot containers in prefab watch list. (Currently disabled containers will stay disabled).");
@@ -967,7 +993,8 @@ namespace Oxide.Plugins
                 "ptboat.deepsea",
                 "rhib.deepsea",
                 "cache/food",
-                "assets/prefabs/satellitecrash/crates"
+                "assets/prefabs/satellitecrash/crates",
+                "natural beehive/beehive.natural"
             });
 
             // If does contain, skip
@@ -1008,19 +1035,7 @@ namespace Oxide.Plugins
             if (addedUnwrapSource)
                 Changed = true;
 
-            if (lootTables?.LootTables != null)
-            {
-                foreach (var kv in lootTables.LootTables)
-                {
-                    if (!IsMissionKey(kv.Key) &&
-                        !kv.Key.Contains("/npc/gingerbread/", StringComparison.OrdinalIgnoreCase) &&
-                        !kv.Key.Contains("/npc/scarecrow/", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    if (_config.Generic.WatchedPrefabs.TryAdd(kv.Key, kv.Value?.Enabled ?? false))
-                        Changed = true;
-                }
-            }
+            SyncWatchedPrefabsFromLootTables(enableIfTableEnabled: false);
 
             if (NewConfigGenerated)
             {
@@ -1030,6 +1045,54 @@ namespace Oxide.Plugins
 
             Pool.FreeUnmanaged(ref negativePartialNames);
             Pool.FreeUnmanaged(ref partialNames);
+        }
+
+        private void EnsureNaturalBeehiveWatched()
+        {
+            if (_config?.Generic?.WatchedPrefabs == null)
+                return;
+
+            bool enable = NewConfigGenerated || (NewSave && _config.Generic.AutoEnableNewContainers);
+            if (lootTables?.LootTables != null
+                && lootTables.LootTables.TryGetValue(NATURAL_BEEHIVE_PREFAB, out PrefabLoot? table)
+                && table?.Enabled == true)
+                enable = true;
+
+            if (!_config.Generic.WatchedPrefabs.TryGetValue(NATURAL_BEEHIVE_PREFAB, out bool current))
+            {
+                _config.Generic.WatchedPrefabs[NATURAL_BEEHIVE_PREFAB] = enable;
+                Changed = true;
+                return;
+            }
+
+            if (enable && !current)
+            {
+                _config.Generic.WatchedPrefabs[NATURAL_BEEHIVE_PREFAB] = true;
+                Changed = true;
+            }
+        }
+
+        private void SyncWatchedPrefabsFromLootTables(bool enableIfTableEnabled)
+        {
+            if (lootTables?.LootTables == null || _config?.Generic?.WatchedPrefabs == null)
+                return;
+
+            foreach (var kv in lootTables.LootTables)
+            {
+                bool enabled = kv.Value?.Enabled ?? false;
+                if (enableIfTableEnabled && enabled)
+                {
+                    if (!_config.Generic.WatchedPrefabs.TryGetValue(kv.Key, out bool current) || !current)
+                    {
+                        _config.Generic.WatchedPrefabs[kv.Key] = true;
+                        Changed = true;
+                    }
+                    continue;
+                }
+
+                if (_config.Generic.WatchedPrefabs.TryAdd(kv.Key, enabled))
+                    Changed = true;
+            }
         }
 
         private static string ToUnwrapKey(ItemDefinition itemDefinition)
@@ -5014,6 +5077,9 @@ namespace Oxide.Plugins
 
                             Respond("Loaded new LootTable successfully!");
                             restoreFailsafe = false;
+
+                            SyncWatchedPrefabsFromLootTables(enableIfTableEnabled: true);
+                            EnsureNaturalBeehiveWatched();
                         }
                         catch (Exception ex)
                         {
@@ -5875,6 +5941,58 @@ namespace Oxide.Plugins
         }
         #endregion
 
+        private static readonly Dictionary<string, Dictionary<string, int>> VanillaQuarryPerDiesel =
+            new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase)
+            {
+                [QUARRY_HQM_KEY] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["hq.metal.ore"] = 50
+                },
+                [QUARRY_STONE_KEY] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["stones"] = 5000,
+                    ["metal.ore"] = 1000
+                },
+                [QUARRY_SULFUR_KEY] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["sulfur.ore"] = 1000
+                },
+                [QUARRY_EXCAVATOR_KEY] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["stones"] = 10000,
+                    ["metal.fragments"] = 5000,
+                    ["sulfur.ore"] = 2000,
+                    ["hq.metal.ore"] = 100
+                }
+            };
+
+        private bool EnsureQuarryHarvestDefaults()
+        {
+            bool changed = false;
+            Ore.QuarryHarvest = Ore.QuarryHarvest == null
+                ? new Dictionary<string, QuarryHarvestSettings>(StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, QuarryHarvestSettings>(Ore.QuarryHarvest, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var pair in VanillaQuarryPerDiesel)
+            {
+                if (Ore.QuarryHarvest.TryGetValue(pair.Key, out var existing) && existing?.Outputs is { Count: > 0 })
+                    continue;
+
+                var outputs = new List<QuarryHarvestOutput>(pair.Value.Count);
+                foreach (var amount in pair.Value)
+                    outputs.Add(new QuarryHarvestOutput { Shortname = amount.Key, Amount = amount.Value });
+
+                Ore.QuarryHarvest[pair.Key] = new QuarryHarvestSettings
+                {
+                    OverrideGatherAmounts = existing?.OverrideGatherAmounts ?? false,
+                    Outputs = outputs
+                };
+                changed = true;
+            }
+
+            return changed;
+        }
+
         private void InitOreSpawnSystem()
         {
             Ore.NpcHarvest = Ore.NpcHarvest == null
@@ -5883,10 +6001,15 @@ namespace Oxide.Plugins
 
             try
             {
-                if (PopulateVanillaGatherDefaults(_gatherRatesNeedsVanillaFill))
+                bool vanillaChanged = PopulateVanillaGatherDefaults(_gatherRatesNeedsVanillaFill);
+                bool quarryChanged = EnsureQuarryHarvestDefaults();
+                if (vanillaChanged || quarryChanged)
                 {
                     DataSystem.SaveOreSpawn();
-                    Log("Loaded vanilla gather, pickup, and harvest amounts from in-game prefabs into GatherRates.json");
+                    if (vanillaChanged)
+                        Log("Loaded vanilla gather, pickup, and harvest amounts from in-game prefabs into GatherRates.json");
+                    if (quarryChanged)
+                        Log("Added quarry and excavator diesel amounts to GatherRates.json");
                 }
             }
             catch (Exception ex)
@@ -5970,6 +6093,7 @@ namespace Oxide.Plugins
 
         private void RestartOreSpawnSystem()
         {
+            EnsureQuarryHarvestDefaults();
             StopSpawning();
             if (IsOreSystemEnabled())
             {
@@ -6085,6 +6209,17 @@ namespace Oxide.Plugins
                 Unsubscribe(nameof(OnDispenserBonus));
             }
 
+            if (HasAnyQuarryHarvestOverride())
+            {
+                Subscribe(nameof(OnQuarryGather));
+                Subscribe(nameof(OnExcavatorGather));
+            }
+            else
+            {
+                Unsubscribe(nameof(OnQuarryGather));
+                Unsubscribe(nameof(OnExcavatorGather));
+            }
+
             if (HasAnyCollectableEnabled() || HasAnyCollectableBonusLoot() || HasAnyCollectablePickupOverride())
             {
                 Subscribe(nameof(OnCollectiblePickup));
@@ -6113,6 +6248,8 @@ namespace Oxide.Plugins
         {
             Unsubscribe(nameof(OnDispenserGather));
             Unsubscribe(nameof(OnDispenserBonus));
+            Unsubscribe(nameof(OnQuarryGather));
+            Unsubscribe(nameof(OnExcavatorGather));
             Unsubscribe(nameof(OnCollectiblePickup));
             Unsubscribe(nameof(OnEntityKill));
             Unsubscribe(nameof(OnEntitySpawned));
@@ -6167,8 +6304,32 @@ namespace Oxide.Plugins
                 if (!IsNodeType(pair.Type) || pair.Settings is null) continue;
                 if (pair.Settings.OverrideGatherAmounts && pair.Settings.GatherOutputs is { Count: > 0 })
                     return true;
+                if (HasCustomGatherMultiplier(pair.Settings))
+                    return true;
             }
             return false;
+        }
+
+        private static float GetConfiguredGatherMultiplier(OreTypeSettings settings)
+        {
+            if (settings == null)
+                return 1f;
+            var n = settings.GatherMultiplier;
+            if (n <= 0f)
+                return 1f;
+            return Mathf.Clamp(n, 0.01f, 100f);
+        }
+
+        private static bool HasCustomGatherMultiplier(OreTypeSettings settings)
+        {
+            return Mathf.Abs(GetConfiguredGatherMultiplier(settings) - 1f) > 0.0001f;
+        }
+
+        private static float CombineGatherScale(OreTypeSettings settings, OreNodeData oreData)
+        {
+            var configured = GetConfiguredGatherMultiplier(settings);
+            var rich = oreData.GatherMultiplier > 0f ? oreData.GatherMultiplier : 1f;
+            return configured * rich;
         }
 
         private bool HasAnyNpcHarvestOverride()
@@ -6177,6 +6338,17 @@ namespace Oxide.Plugins
             foreach (var harvest in Ore.NpcHarvest.Values)
             {
                 if (harvest != null && harvest.OverrideGatherAmounts && harvest.GatherOutputs is { Count: > 0 })
+                    return true;
+            }
+            return false;
+        }
+
+        private bool HasAnyQuarryHarvestOverride()
+        {
+            if (Ore.QuarryHarvest == null || Ore.QuarryHarvest.Count == 0) return false;
+            foreach (var harvest in Ore.QuarryHarvest.Values)
+            {
+                if (harvest != null && harvest.OverrideGatherAmounts && harvest.Outputs is { Count: > 0 })
                     return true;
             }
             return false;
@@ -7340,6 +7512,117 @@ namespace Oxide.Plugins
             return _hasShouldBLCollectablePickup && Interface.CallHook("ShouldBLCollectablePickup", collectible, player) != null;
         }
 
+        private bool ShouldSkipQuarryGatherOverride()
+        {
+            if (ShouldStandDownGatherRates())
+            {
+                NotifyGatherStandDownIfNeeded();
+                return true;
+            }
+
+            return false;
+        }
+
+        private object OnQuarryGather(MiningQuarry quarry, Item item)
+        {
+            if (quarry == null || item?.info == null)
+                return null;
+            if (ShouldSkipQuarryGatherOverride())
+                return null;
+
+            var key = GetQuarryHarvestKey(quarry);
+            if (string.IsNullOrEmpty(key) || !TryGetQuarryHarvestSettings(key, out var settings))
+                return null;
+            if (!settings.OverrideGatherAmounts)
+                return null;
+
+            ApplyQuarryOutputOverride(settings, key, item);
+            return item.amount <= 0 ? (object)true : null;
+        }
+
+        private object OnExcavatorGather(ExcavatorArm excavator, Item item)
+        {
+            if (excavator == null || item?.info == null)
+                return null;
+            if (ShouldSkipQuarryGatherOverride())
+                return null;
+            if (!TryGetQuarryHarvestSettings(QUARRY_EXCAVATOR_KEY, out var settings) || !settings.OverrideGatherAmounts)
+                return null;
+
+            ApplyQuarryOutputOverride(settings, QUARRY_EXCAVATOR_KEY, item);
+            return item.amount <= 0 ? (object)true : null;
+        }
+
+        private bool TryGetQuarryHarvestSettings(string key, out QuarryHarvestSettings settings)
+        {
+            settings = null;
+            if (string.IsNullOrEmpty(key) || Ore.QuarryHarvest == null)
+                return false;
+            return Ore.QuarryHarvest.TryGetValue(key, out settings) && settings != null;
+        }
+
+        private static string GetQuarryHarvestKey(MiningQuarry quarry)
+        {
+            if (quarry == null)
+                return null;
+
+            switch (quarry.staticType)
+            {
+                case MiningQuarry.QuarryType.HQM:
+                    return QUARRY_HQM_KEY;
+                case MiningQuarry.QuarryType.Sulfur:
+                    return QUARRY_SULFUR_KEY;
+                case MiningQuarry.QuarryType.Basic:
+                    return QUARRY_STONE_KEY;
+            }
+
+            var monument = quarry.GetComponentInParent<MonumentInfo>();
+            var name = monument != null
+                ? $"{monument.name} {monument.transform.root?.name}"
+                : quarry.PrefabName ?? string.Empty;
+            if (name.IndexOf("mining_quarry_c", StringComparison.OrdinalIgnoreCase) >= 0)
+                return QUARRY_HQM_KEY;
+            if (name.IndexOf("mining_quarry_a", StringComparison.OrdinalIgnoreCase) >= 0)
+                return QUARRY_SULFUR_KEY;
+            if (name.IndexOf("mining_quarry_b", StringComparison.OrdinalIgnoreCase) >= 0)
+                return QUARRY_STONE_KEY;
+            return null;
+        }
+
+        private static void ApplyQuarryOutputOverride(QuarryHarvestSettings settings, string key, Item item)
+        {
+            if (settings?.Outputs == null || item?.info == null)
+                return;
+
+            var shortname = item.info.shortname;
+            int? configured = null;
+            for (var i = 0; i < settings.Outputs.Count; i++)
+            {
+                var output = settings.Outputs[i];
+                if (output != null && string.Equals(output.Shortname, shortname, StringComparison.OrdinalIgnoreCase))
+                {
+                    configured = output.Amount;
+                    break;
+                }
+            }
+
+            if (!configured.HasValue)
+                return;
+            if (!VanillaQuarryPerDiesel.TryGetValue(key, out var vanillaMap)
+                || !vanillaMap.TryGetValue(shortname, out var vanilla)
+                || vanilla <= 0)
+                return;
+
+            if (configured.Value <= 0)
+            {
+                item.amount = 0;
+                return;
+            }
+
+            long scaled = (long)item.amount * configured.Value / vanilla;
+            item.amount = (int)Math.Max(1, Math.Min(int.MaxValue, scaled));
+        }
+
         private void OnPluginLoaded(Plugin plugin)
         {
             if (plugin == null || plugin == this)
@@ -7417,10 +7700,11 @@ namespace Oxide.Plugins
                                 item.info = hqmDef;
                         }
 
-                        if (oreData.GatherMultiplier > 1f)
+                        var scale = CombineGatherScale(settings, oreData);
+                        if (Mathf.Abs(scale - 1f) > 0.0001f)
                         {
-                            item.amount = Mathf.FloorToInt(item.amount * oreData.GatherMultiplier);
-                            if (!isBonus && Ore.RichVein.PlayEffect)
+                            item.amount = Mathf.Max(0, Mathf.FloorToInt(item.amount * scale));
+                            if (!isBonus && oreData.GatherMultiplier > 1f && Ore.RichVein.PlayEffect)
                                 Effect.server.Run(RICH_VEIN_EFFECT, entity.transform.position, Vector3.up);
                             owned = true;
                         }
@@ -7441,6 +7725,24 @@ namespace Oxide.Plugins
                 var dummy = new OreNodeData(OreType.Stone, entity.transform.position, default(TerrainBiome.Enum), 1f, entity.PrefabName);
                 ApplyGatherOverride(dispenser, player, item, dummy, npcHarvest.GatherOutputs, isBonus);
                 return FinishOwnedDispenserHit(player, item, isBonus);
+            }
+
+            if (!skipRates)
+            {
+                var inferred = InferOreTypeFromPrefab(entity.PrefabName);
+                if (!inferred.HasValue && entity is TreeEntity)
+                    inferred = OreType.Tree;
+
+                if (inferred.HasValue && IsNodeType(inferred.Value))
+                {
+                    var settings = GetOreTypeSettings(inferred.Value);
+                    var scale = GetConfiguredGatherMultiplier(settings);
+                    if (Mathf.Abs(scale - 1f) > 0.0001f)
+                    {
+                        item.amount = Mathf.Max(0, Mathf.FloorToInt(item.amount * scale));
+                        return FinishOwnedDispenserHit(player, item, isBonus);
+                    }
+                }
             }
 
             return null;
@@ -7553,9 +7855,9 @@ namespace Oxide.Plugins
         }
 
         private bool ApplyGatherOverride(ResourceDispenser dispenser, BasePlayer player, Item item, OreNodeData oreData, OreTypeSettings settings, bool isBonus)
-            => ApplyGatherOverride(dispenser, player, item, oreData, settings.GatherOutputs, isBonus);
+            => ApplyGatherOverride(dispenser, player, item, oreData, settings.GatherOutputs, isBonus, GetConfiguredGatherMultiplier(settings));
 
-        private bool ApplyGatherOverride(ResourceDispenser dispenser, BasePlayer player, Item item, OreNodeData oreData, List<OreGatherOutput> outputs, bool isBonus)
+        private bool ApplyGatherOverride(ResourceDispenser dispenser, BasePlayer player, Item item, OreNodeData oreData, List<OreGatherOutput> outputs, bool isBonus, float configuredMultiplier = 1f)
         {
             var entity = dispenser.baseEntity;
             if (entity is null || outputs == null) return false;
@@ -7570,7 +7872,9 @@ namespace Oxide.Plugins
                 session.ExtraGrantedThisFrame.Clear();
             }
 
-            var multiplier = oreData.GatherMultiplier > 1f ? oreData.GatherMultiplier : 1f;
+            var rich = oreData.GatherMultiplier > 0f ? oreData.GatherMultiplier : 1f;
+            var configured = configuredMultiplier > 0f ? configuredMultiplier : 1f;
+            var multiplier = rich * configured;
             var vanillaName = item.info?.shortname ?? string.Empty;
             var vanillaHit = Mathf.Max(0, item.amount);
             var startForItem = session.VanillaStartByItem.TryGetValue(vanillaName, out var itemStart) ? itemStart : 0f;
