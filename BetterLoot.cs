@@ -309,6 +309,7 @@ namespace Oxide.Plugins
         private const double BASE_ITEM_RARITY = 2;
         private const string ADMIN_PERM = "betterloot.admin";
         private const string ORE_PERM_SHOW = "betterloot.oreshow";
+        private const int MAX_SHOW_PINGS = 48;
         private const string ORE_DATA_FILE = "BetterLoot_OreSpawn";
         private const string STONE_ORE_PREFAB = "assets/bundled/prefabs/autospawn/resource/ores/stone-ore.prefab";
         private const string METAL_ORE_PREFAB = "assets/bundled/prefabs/autospawn/resource/ores/metal-ore.prefab";
@@ -6658,16 +6659,13 @@ namespace Oxide.Plugins
         #endregion
 
         #region Commands
-        [ChatCommand("show")]
-        private void CmdShow(BasePlayer player, string command, string[] args)
-        {
-            if (args is null || args.Length == 0 || !TryParseShowKind(args, out _))
-            {
-                PrintToChat(player, "Usage: <color=#ffb347>/show ore</color> or <color=#ffb347>/show collectables</color>");
-                return;
-            }
-            CmdNodesShow(player, command, args);
-        }
+        private const string ShowUsage = "Usage: <color=#ffb347>/blshow ore</color> or <color=#ffb347>/blshow collectables</color> (also <color=#ffb347>/betterlootshow</color>)";
+
+        [ChatCommand("blshow")]
+        private void CmdBlShow(BasePlayer player, string command, string[] args) => CmdNodesShow(player, command, args);
+
+        [ChatCommand("betterlootshow")]
+        private void CmdBetterLootShow(BasePlayer player, string command, string[] args) => CmdNodesShow(player, command, args);
 
         [ChatCommand("oreshow")]
         private void CmdNodesShow(BasePlayer player, string command, string[] args)
@@ -6679,7 +6677,7 @@ namespace Oxide.Plugins
             }
             if (!TryParseShowKind(args, out var kind))
             {
-                PrintToChat(player, "Usage: <color=#ffb347>/show ore</color> or <color=#ffb347>/show collectables</color>");
+                PrintToChat(player, ShowUsage);
                 return;
             }
             StopShowCoroutine(player.userID);
@@ -6687,7 +6685,10 @@ namespace Oxide.Plugins
         }
 
         [ChatCommand("orehide")]
-        private void CmdNodesHide(BasePlayer player, string command, string[] args)
+        private void CmdNodesHide(BasePlayer player, string command, string[] args) => CmdBlHide(player, command, args);
+
+        [ChatCommand("blhide")]
+        private void CmdBlHide(BasePlayer player, string command, string[] args)
         {
             if (!HasOrePermission(player, ORE_PERM_SHOW))
             {
@@ -6699,20 +6700,30 @@ namespace Oxide.Plugins
             PrintToChat(player, "Ore markers cleared from your map.");
         }
 
+        [ChatCommand("betterloothide")]
+        private void CmdBetterLootHide(BasePlayer player, string command, string[] args) => CmdBlHide(player, command, args);
+
         [ChatCommand("orehelp")]
-        private void CmdOreHelp(BasePlayer player, string command, string[] args)
+        private void CmdOreHelp(BasePlayer player, string command, string[] args) => CmdBlHelp(player, command, args);
+
+        [ChatCommand("blhelp")]
+        private void CmdBlHelp(BasePlayer player, string command, string[] args)
         {
             var sb = Pool.Get<StringBuilder>();
             sb.Clear();
             sb.AppendLine("=== <color=#4d94ff>BetterLoot Ore Commands</color> ===");
             sb.AppendLine("Configure ores and collectables in the Looty editor Ores tab, then deploy with looty.");
-            sb.AppendLine("<color=#ffb347>/show ore</color> - Ping ore nodes on your map for 30 seconds.");
-            sb.AppendLine("<color=#ffb347>/show collectables</color> - Ping collectables on your map for 30 seconds.");
-            sb.AppendLine("<color=#ffb347>/oreshow</color> - Ping both (same as /show all).");
-            sb.AppendLine("<color=#ffb347>/orehide</color> - Hide those markers from map.");
+            sb.AppendLine("<color=#ffb347>/blshow ore</color> - Ping nearby ore nodes on your map for 30 seconds.");
+            sb.AppendLine("<color=#ffb347>/blshow collectables</color> - Ping nearby collectables on your map for 30 seconds.");
+            sb.AppendLine("<color=#ffb347>/betterlootshow</color> - Same as /blshow.");
+            sb.AppendLine("<color=#ffb347>/oreshow</color> - Ping both (same as /blshow all).");
+            sb.AppendLine("<color=#ffb347>/blhide</color> - Hide those markers from map.");
             PrintToChat(player, sb.ToString());
             Pool.FreeUnmanaged(ref sb);
         }
+
+        [ChatCommand("betterloothelp")]
+        private void CmdBetterLootHelp(BasePlayer player, string command, string[] args) => CmdBlHelp(player, command, args);
         #endregion
 
         #region Core Spawning System
@@ -8262,8 +8273,8 @@ namespace Oxide.Plugins
 
             if (pluginCount > 0)
             {
-                PrintToChat(player, $"Showing {pluginCount} plugin {label} on your map for 30 seconds...");
-                UpdateOreMarkersForPlayer(player, kind: kind);
+                var shown = UpdateOreMarkersForPlayer(player, null, kind, out var found);
+                PrintToChat(player, FormatShowCountMessage(shown, found, $"plugin {label}"));
                 switch (kind)
                 {
                     case OreShowKind.Collectable:
@@ -8279,8 +8290,8 @@ namespace Oxide.Plugins
             }
             else
             {
-                PrintToChat(player, $"No plugin-tracked {label} yet. Showing {totalCount} world {label} on your map for 30 seconds...");
-                UpdateOreMarkersForPlayer(player, worldMarkers, kind);
+                var shown = UpdateOreMarkersForPlayer(player, worldMarkers, kind, out var found);
+                PrintToChat(player, $"No plugin-tracked {label} yet. {FormatShowCountMessage(shown, found, $"world {label}")}");
             }
 
             PrintToChat(player, "Check your map (G) to see the locations!");
@@ -8344,7 +8355,14 @@ namespace Oxide.Plugins
             mapNoteList.Dispose();
         }
 
-        private void UpdateOreMarkersForPlayer(BasePlayer player, List<OreNodeData> extraMarkers = null, OreShowKind kind = OreShowKind.All)
+        private static string FormatShowCountMessage(int shown, int found, string label)
+        {
+            if (shown < found)
+                return $"Showing the {shown} closest of {found} {label} on your map for 30 seconds.";
+            return $"Showing {found} {label} on your map for 30 seconds...";
+        }
+
+        private int UpdateOreMarkersForPlayer(BasePlayer player, List<OreNodeData> extraMarkers, OreShowKind kind, out int totalFound)
         {
             ClearOreMarkersForPlayer(player);
 
@@ -8354,11 +8372,15 @@ namespace Oxide.Plugins
                 playerMarkers[player.userID] = currentMarkers;
             }
 
+            var origin = player.transform.position;
+            var scored = new List<(float Dist, Vector3 Pos, OreType Type, float Mult)>(256);
+
             foreach (var kvp in spawnedOres)
             {
                 if (kvp.Key is null || kvp.Key.IsDestroyed) continue;
                 if (!MatchesShowKind(kvp.Value.Type, kind)) continue;
-                currentMarkers.Add(CreateOreMarker(kvp.Value.Position, kvp.Value.Type, kvp.Value.GatherMultiplier));
+                var pos = kvp.Value.Position;
+                scored.Add(((pos - origin).sqrMagnitude, pos, kvp.Value.Type, kvp.Value.GatherMultiplier));
             }
 
             if (extraMarkers != null)
@@ -8366,11 +8388,23 @@ namespace Oxide.Plugins
                 foreach (var data in extraMarkers)
                 {
                     if (!MatchesShowKind(data.Type, kind)) continue;
-                    currentMarkers.Add(CreateOreMarker(data.Position, data.Type, data.GatherMultiplier));
+                    scored.Add(((data.Position - origin).sqrMagnitude, data.Position, data.Type, data.GatherMultiplier));
                 }
             }
 
+            totalFound = scored.Count;
+            if (totalFound > MAX_SHOW_PINGS)
+                scored.Sort((a, b) => a.Dist.CompareTo(b.Dist));
+
+            var take = Math.Min(MAX_SHOW_PINGS, totalFound);
+            for (var i = 0; i < take; i++)
+            {
+                var item = scored[i];
+                currentMarkers.Add(CreateOreMarker(item.Pos, item.Type, item.Mult));
+            }
+
             SendPingsToPlayer(player, currentMarkers);
+            return take;
         }
 
         private void ClearOreMarkersForPlayer(BasePlayer player)
